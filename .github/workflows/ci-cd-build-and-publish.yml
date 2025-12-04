@@ -1,0 +1,98 @@
+name: CI/CD - Build Docker, Push to GHCR and Update Site
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  # 💡 ¡IMPORTANTE! El REPOSITORY_OWNER se obtiene automáticamente.
+  # El nombre de la imagen final será ghcr.io/littlepidev/mi-web-app
+  REGISTRY: ghcr.io
+  REPOSITORY_OWNER: ${{ github.repository_owner }}
+  # 💡 Define el nombre de tu imagen Docker en GHCR.
+  IMAGE_NAME: mi-web-app
+  # Define la ruta al archivo que se modificará.
+  SITE_INDEX: index.html
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Necesario para hacer el commit de vuelta a index.html
+      packages: write  # Necesario para publicar en GHCR
+      id-token: write  # Necesario para autenticación OIDC si se usa, aunque usaremos GITHUB_TOKEN
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        # Necesario para que el paso de 'add-and-commit' tenga acceso total al repo.
+        with:
+          fetch-depth: 0
+
+      # --- 1. CONFIGURACIÓN DOCKER ---
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          # Usamos el GITHUB_TOKEN provisto por GitHub Actions
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- 2. METADATOS Y TAGS ---
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.REPOSITORY_OWNER }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=sha-${{shorthash}}
+      
+      # --- 3. BUILD Y PUSH DE LA IMAGEN ---
+      - name: Build and push Docker image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # 💡 Asegúrate que la ruta al Dockerfile es correcta
+          file: ./Dockerfile
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      # --- 4. ACTUALIZACIÓN AUTOMÁTICA DEL ARCHIVO INDEX.HTML ---
+      - name: Update index.html with Build Info
+        id: update_index
+        run: |
+          # 1. Definir variables de build
+          # Extraemos el tag SHA de la lista de tags generados
+          SHA_TAG=$(echo "${{ steps.meta.outputs.tags }}" | grep 'sha-' | head -n 1)
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          # 2. Generar el bloque HTML con la información del build
+          BUILD_INFO_BLOCK="<!-- BUILD_INFO -->\n<div class=\"build-info\">\n<p><strong>Build:</strong> ${TIMESTAMP}</p>\n<p><strong>SHA:</strong> ${{ github.sha }}</p>\n<p><strong>Image:</strong> ${SHA_TAG}</p>\n</div>\n<!-- END_BUILD_INFO -->"
+          
+          # 3. Escapar el bloque para sed (reemplazo seguro)
+          ESCAPED_BLOCK=$(echo "$BUILD_INFO_BLOCK" | sed -e ':a' -e 'N' -e '$!ba' -e 's/[&/\]/\\&/g' -e 's/$/\\n/' | tr -d '\n')
+          
+          # 4. Reemplazar el bloque existente en index.html
+          # El patrón busca la línea que empieza con <!-- BUILD_INFO --> hasta la que contiene <!-- END_BUILD_INFO -->
+          sed -i '/<!-- BUILD_INFO -->/,/<!-- END_BUILD_INFO -->/c\'"$ESCAPED_BLOCK"'' ${{ env.SITE_INDEX }}
+          
+          # 5. Imprimir el contenido para verificar (opcional, para depuración)
+          echo "Contenido de ${{ env.SITE_INDEX }} actualizado:"
+          cat ${{ env.SITE_INDEX }}
+        shell: bash
+
+      - name: Commit changes to index.html
+        # Usamos una acción para hacer commit y push automáticamente
+        uses: EndBug/add-and-commit@v9
+        with:
+          author_name: CI/CD Bot
+          author_email: actions@github.com
+          message: "CI(bot): Auto-update index.html with Build SHA ${{ github.sha }}"
+          add: '${{ env.SITE_INDEX }}'
+          # El token GITHUB_TOKEN es suficiente y evita que este commit dispare el workflow nuevamente.
+          token: ${{ secrets.GITHUB_TOKEN }}
