@@ -14,7 +14,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     env:
-      IMAGE_NAME: ghcr.io/${{ format('ghcr.io/{0}/mi-web-app', toLowerCase(github.repository_owner)) }}/mi-web-app
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/mi-web-app
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
