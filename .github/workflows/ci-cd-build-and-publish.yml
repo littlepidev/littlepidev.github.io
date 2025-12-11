@@ -2,99 +2,87 @@ name: CI/CD - Build Docker, Push to GHCR and Update Site
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
 
-env:
-  # 💡 ¡IMPORTANTE! El REPOSITORY_OWNER se obtiene automáticamente.
-  # El nombre de la imagen final será ghcr.io/littlepidev/mi-web-app
-  REGISTRY: ghcr.io
-  REPOSITORY_OWNER: ${{ github.repository_owner }}
-  # 💡 Define el nombre de tu imagen Docker en GHCR.
-  IMAGE_NAME: mi-web-app
-  # Define la ruta al archivo que se modificará.
-  SITE_INDEX: index.html
+permissions:
+  contents: write   # necesario para hacer commit en el repo
+  packages: write   # para publicar en GHCR
+  id-token: write   # si usas OIDC con ghcr (opcional)
 
 jobs:
-  build-and-deploy:
+  build-and-push:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # Necesario para hacer el commit de vuelta a index.html
-      packages: write  # Necesario para publicar en GHCR
-      id-token: write  # Necesario para autenticación OIDC si se usa, aunque usaremos GITHUB_TOKEN
-      
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/mi-web-app
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        # Necesario para que el paso de 'add-and-commit' tenga acceso total al repo.
         with:
-          fetch-depth: 0
+          persist-credentials: true
 
-      # --- 1. CONFIGURACIÓN DOCKER ---
+      - name: Set up QEMU (optional for multi-arch)
+        uses: docker/setup-qemu-action@v2
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      
-      - name: Log in to GitHub Container Registry (GHCR)
-        uses: docker/login-action@v3
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.repository_owner }}
-          # Usamos el GITHUB_TOKEN provisto por GitHub Actions
+          registry: ghcr.io
+          username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- 2. METADATOS Y TAGS ---
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.REPOSITORY_OWNER }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest
-            # SOLUCIÓN: Usamos 'short' como palabra clave de formato interno de la acción
-            type=sha,format=sha-{short} 
-      
-      # --- 3. BUILD Y PUSH DE LA IMAGEN ---
       - name: Build and push Docker image to GHCR
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v4
         with:
           context: .
+          file: ./Dockerfile            # <- ajusta la ruta al Dockerfile del proyecto (por ejemplo ./nginx/Dockerfile)
           push: true
-          # 💡 Asegúrate que la ruta al Dockerfile es correcta
-          file: ./Dockerfile
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # platforms: linux/amd64,linux/arm64   # opcional
 
-      # --- 4. ACTUALIZACIÓN AUTOMÁTICA DEL ARCHIVO INDEX.HTML ---
-      - name: Update index.html with Build Info
-        id: update_index
+      - name: Create build-info (timestamp + sha)
+        id: buildinfo
         run: |
-          # 1. Definir variables de build
-          # Extraemos el tag SHA de la lista de tags generados
-          # Ahora buscamos el tag que empiece por 'sha-' (ej. sha-a0b1c2d)
-          SHA_TAG=$(echo "${{ steps.meta.outputs.tags }}" | grep 'sha-' | head -n 1)
-          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          
-          # 2. Generar el bloque HTML con la información del build
-          BUILD_INFO_BLOCK="<!-- BUILD_INFO -->\n<div class=\"build-info\">\n<p><strong>Build:</strong> ${TIMESTAMP}</p>\n<p><strong>SHA:</strong> ${{ github.sha }}</p>\n<p><strong>Image:</strong> ${SHA_TAG}</p>\n</div>\n<!-- END_BUILD_INFO -->"
-          
-          # 3. Escapar el bloque para sed (reemplazo seguro)
-          ESCAPED_BLOCK=$(echo "$BUILD_INFO_BLOCK" | sed -e ':a' -e 'N' -e '$!ba' -e 's/[&/\]/\\&/g' -e 's/$/\\n/' | tr -d '\n')
-          
-          # 4. Reemplazar el bloque existente en index.html
-          # El patrón busca la línea que empieza con <!-- BUILD_INFO --> hasta la que contiene <!-- END_BUILD_INFO -->
-          sed -i '/<!-- BUILD_INFO -->/,/<!-- END_BUILD_INFO -->/c\'"$ESCAPED_BLOCK"'' ${{ env.SITE_INDEX }}
-          
-          # 5. Imprimir el contenido para verificar (opcional, para depuración)
-          echo "Contenido de ${{ env.SITE_INDEX }} actualizado:"
-          cat ${{ env.SITE_INDEX }}
-        shell: bash
+          echo "BUILD_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_ENV
+          echo "BUILD_SHA=${GITHUB_SHA}" >> $GITHUB_ENV
+          echo "BUILD_TAG=${IMAGE_NAME}:${GITHUB_SHA}" >> $GITHUB_ENV
 
-      - name: Commit changes to index.html
-        # Usamos una acción para hacer commit y push automáticamente
-        uses: EndBug/add-and-commit@v9
+      - name: Update index.html with build info
+        id: update-site
+        run: |
+          # Ajusta la ruta al index.html de tu site (ej. ./docs/index.html o ./index.html)
+          SITE_INDEX=index.html
+          if [ ! -f "$SITE_INDEX" ]; then
+            echo "<!-- created by workflow -->" > "$SITE_INDEX"
+            echo "<html><body><h1>Autogenerated site</h1></body></html>" >> "$SITE_INDEX"
+          fi
+
+          # Inserta (o reemplaza) un párrafo con la info de build
+          # Usamos una marca HTML <!-- BUILD_INFO --> para localizar dónde insertar
+          BUILD_BLOCK="<p>Build: $BUILD_TS - SHA: $BUILD_SHA - Image: $BUILD_TAG</p>"
+          # Si existe la marca, reemplázala; si no, añade al final
+          if grep -q "<!-- BUILD_INFO -->" "$SITE_INDEX"; then
+            perl -0777 -pe "s/<!-- BUILD_INFO -->.*<!-- END_BUILD_INFO -->/<!-- BUILD_INFO -->\n$BUILD_BLOCK\n<!-- END_BUILD_INFO -->/s" -i "$SITE_INDEX"
+          else
+            # Añadir antes de cierre de body si existe
+            if grep -q "</body>" "$SITE_INDEX"; then
+              perl -0777 -pe "s|</body>|<!-- BUILD_INFO -->\n$BUILD_BLOCK\n<!-- END_BUILD_INFO -->\n</body>|s" -i "$SITE_INDEX"
+            else
+              echo -e "\n<!-- BUILD_INFO -->\n$BUILD_BLOCK\n<!-- END_BUILD_INFO -->" >> "$SITE_INDEX"
+            fi
+          fi
+
+      - name: Commit and push changes to main (if any)
+        uses: stefanzweifel/git-auto-commit-action@v4
         with:
-          author_name: CI/CD Bot
-          author_email: actions@github.com
-          message: "CI(bot): Auto-update index.html with Build SHA ${{ github.sha }}"
-          add: '${{ env.SITE_INDEX }}'
-          # El token GITHUB_TOKEN es suficiente y evita que este commit dispare el workflow nuevamente.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          commit_message: "ci: update site with build info ${{ env.BUILD_TS }} (${{ env.BUILD_SHA }})"
+          file_pattern: "index.html"
+          branch: main
+          author_name: github-actions[bot]
+          author_email: 41898282+github-actions[bot]@users.noreply.github.com
+          # By default this action uses GITHUB_TOKEN so it won't re-trigger this workflow
